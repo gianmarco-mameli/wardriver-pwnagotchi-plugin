@@ -1,10 +1,10 @@
 import logging
-import re
+# import re
 import sqlite3
 import os
 from datetime import datetime, timezone
 import toml
-from threading import Lock
+from threading import Lock, Thread
 import json
 import requests
 from PIL import Image, ImageOps
@@ -28,7 +28,7 @@ class Database():
         self.__path = path
         self.__db_connect()
         self.remove_empty_sessions() # Remove old sessions that don't have networks
-    
+
     def __db_connect(self):
         logging.info('[WARDRIVER] Setting up database connection...')
         self.__connection = sqlite3.connect(self.__path, check_same_thread = False, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
@@ -39,7 +39,7 @@ class Database():
         cursor.close()
         self.__connection.commit()
         logging.info('[WARDRIVER] Succesfully connected to db')
-    
+
     def disconnect(self):
         self.__connection.commit()
         self.__connection.close()
@@ -55,7 +55,7 @@ class Database():
         cursor.close()
         self.__connection.commit()
         return session_id
-    
+
     def add_wardrived_network(self, session_id, mac, ssid, auth_mode, latitude, longitude, altitude, accuracy, channel, rssi, seen_timestamp = None):
         cursor = self.__connection.cursor()
         cursor.execute('SELECT id FROM networks WHERE mac = ? AND ssid = ?', [mac, ssid])
@@ -64,14 +64,14 @@ class Database():
         if(not network_id):
             cursor.execute('INSERT INTO networks(mac, ssid) VALUES (?, ?)', [mac, ssid])
             network_id = cursor.lastrowid
-        
+
         if seen_timestamp:
             cursor.execute('INSERT INTO wardrive(session_id, network_id, auth_mode, latitude, longitude, altitude, accuracy, channel, rssi, seen_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [session_id, network_id, auth_mode, latitude, longitude, altitude, accuracy, channel, rssi, seen_timestamp])
         else:
             cursor.execute('INSERT INTO wardrive(session_id, network_id, auth_mode, latitude, longitude, altitude, accuracy, channel, rssi) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [session_id, network_id, auth_mode, latitude, longitude, altitude, accuracy, channel, rssi])
         cursor.close()
         self.__connection.commit()
-   
+
     def session_networks_count(self, session_id):
         '''
         Return the total networks count for a wardriving session given its id
@@ -112,7 +112,7 @@ class Database():
         cursor.execute('UPDATE sessions SET "wigle_uploaded" = 1 WHERE id = ?', [session_id])
         cursor.close()
         self.__connection.commit()
-    
+
     def wigle_sessions_not_uploaded(self, current_session_id):
         '''
         Return the list of ids of sessions that haven't got uploaded on WiGLE excluding `current_session_id`
@@ -134,7 +134,7 @@ class Database():
         cursor.execute('DELETE FROM sessions WHERE sessions.id NOT IN (SELECT wardrive.session_id FROM wardrive GROUP BY wardrive.session_id)')
         cursor.close()
         self.__connection.commit()
-    
+
     # Web UI queries
     def general_stats(self):
         cursor = self.__connection.cursor()
@@ -150,7 +150,7 @@ class Database():
             'total_sessions': total_sessions,
             'sessions_uploaded': sessions_uploaded
         }
-    
+
     def sessions(self):
         cursor = self.__connection.cursor()
         cursor.execute('SELECT sessions.*, COUNT(wardrive.id) FROM sessions JOIN wardrive ON sessions.id = wardrive.session_id GROUP BY sessions.id')
@@ -165,7 +165,7 @@ class Database():
             })
         cursor.close()
         return sessions
-    
+
     def current_session_stats(self, session_id):
         cursor = self.__connection.cursor()
         cursor.execute('SELECT created_at FROM sessions WHERE id = ?', [session_id])
@@ -197,7 +197,7 @@ class Database():
                 "sessions_count": sessions_count
             })
         cursor.close()
-        
+
         return networks
 
     def map_networks(self):
@@ -216,13 +216,13 @@ class Database():
                 "accuracy": int(accuracy)
             })
         cursor.close()
-        
+
         return networks
 
 class CSVGenerator():
     def __init__(self):
        self.__wigle_info()
-        
+
     def __wigle_info(self):
         '''
         Return info used in CSV pre-header
@@ -259,7 +259,7 @@ class CSVGenerator():
                 board = cpu_model.read().split('\n')[1].split(':')[1][1:]
         except Exception:
             board = 'unknown'
-        
+
         # Brand: currently set equal to model
         brand = model
 
@@ -274,7 +274,7 @@ class CSVGenerator():
 
     def __csv_header(self):
         return 'MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n'
-    
+
     def __csv_network(self, network):
         return f'{network["mac"]},{network["ssid"]},{network["auth_mode"]},{network["seen_timestamp"]},{network["channel"]},{network["rssi"]},{network["latitude"]},{network["longitude"]},{network["altitude"]},{network["accuracy"]},WIFI\n'
 
@@ -286,7 +286,7 @@ class CSVGenerator():
 
     def networks_to_wigle_csv(self, networks):
         pre_header = f'{self.__wigle_file_format},{self.__wigle_app_release},{self.__wigle_model},{self.__wigle_release},{self.__wigle_device},{self.__wigle_display},{self.__wigle_board},{self.__wigle_brand}\n'
-        
+
         return pre_header + self.networks_to_csv(networks)
 
 # Credits to Rai68: https://github.com/rai68/gpsd-easy
@@ -300,7 +300,7 @@ class GpsdClient():
         self.port = port
         self.__gpsd_socket = None
         self.__gpsd_stream = None
-    
+
     def connect(self):
         logging.debug('[WARDRIVER] Connecting to GPSD socket')
         for attempt in range(self.MAX_RETRIES):
@@ -354,6 +354,124 @@ class GpsdClient():
                     return None
         return None
 
+
+class Gps2IpClient():
+    DEFAULT_HOST = '172.20.10.1'
+    DEFAULT_PORT = 11123
+
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.coordinates = {
+            'Latitude': None,
+            'Longitude': None,
+            'Altitude': None
+        }
+        self.__socket = None
+        self.__stream = None
+        self.__last_altitude = None
+        self.__running = False
+        self.__thread = None
+
+    def connect(self):
+        logging.debug('[WARDRIVER] Connecting to gps2ip socket')
+        try:
+            self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.__socket.settimeout(60)
+            self.__socket.connect((self.host, self.port))
+            self.__stream = self.__socket.makefile(mode='r')
+            self.__running = True
+            self.__thread = Thread(target=self.__read_loop, daemon=True)
+            self.__thread.start()
+            logging.info('[WARDRIVER] Connected to gps2ip socket')
+        except Exception as e:
+            logging.critical(f'[WARDRIVER] Failed to connect to gps2ip socket: {e}')
+            self.__socket = None
+            self.__stream = None
+
+    def disconnect(self):
+        self.__running = False
+        if self.__stream:
+            self.__stream.close()
+            self.__stream = None
+        if self.__socket:
+            self.__socket.close()
+            self.__socket = None
+
+    def is_connected(self):
+        return self.__running and self.__thread is not None and self.__thread.is_alive()
+
+    def __nmea_to_decimal(self, coordinate, hemisphere):
+        value = float(coordinate)
+        degrees = int(value / 100)
+        minutes = value - (degrees * 100)
+        decimal = degrees + (minutes / 60)
+        if hemisphere in ['S', 'W']:
+            decimal = -decimal
+        return decimal
+
+    def __parse_nmea(self, sentence):
+        if not sentence:
+            return None
+        payload = sentence.split('*')[0]
+        fields = payload.split(',')
+        if len(fields) < 7:
+            return None
+        sentence_type = fields[0]
+        if sentence_type in ['$GPGGA', '$GNGGA'] and len(fields) > 9:
+            latitude = self.__nmea_to_decimal(fields[2], fields[3])
+            longitude = self.__nmea_to_decimal(fields[4], fields[5])
+            altitude = self.__last_altitude
+            if fields[9] != '':
+                altitude = float(fields[9])
+            self.__last_altitude = altitude
+            return {'Latitude': latitude, 'Longitude': longitude, 'Altitude': altitude}
+        if sentence_type in ['$GPRMC', '$GNRMC'] and len(fields) > 6:
+            latitude = self.__nmea_to_decimal(fields[3], fields[4])
+            longitude = self.__nmea_to_decimal(fields[5], fields[6])
+            return {'Latitude': latitude, 'Longitude': longitude, 'Altitude': self.__last_altitude}
+        return None
+
+    def __clear_coordinates(self):
+        self.coordinates['Latitude'] = None
+        self.coordinates['Longitude'] = None
+        self.coordinates['Altitude'] = None
+
+    def __read_loop(self):
+        while self.__running:
+            try:
+                line = self.__stream.readline()
+                if not line:
+                    raise Exception('gps2ip stream closed')
+                sentence = line.strip().replace('\x00', '')
+                if not sentence or not sentence.startswith('$'):
+                    continue
+                parsed = self.__parse_nmea(sentence)
+                if parsed and parsed['Latitude'] is not None and parsed['Longitude'] is not None:
+                    self.coordinates['Latitude'] = parsed['Latitude']
+                    self.coordinates['Longitude'] = parsed['Longitude']
+                    self.coordinates['Altitude'] = parsed['Altitude']
+            except socket.timeout:
+                logging.warning('[WARDRIVER] gps2ip no data for 60s, clearing cached coordinates')
+                self.__clear_coordinates()
+            except Exception as e:
+                logging.error(f'[WARDRIVER] gps2ip read error: {e}. Reconnecting...')
+                if self.__stream:
+                    self.__stream.close()
+                    self.__stream = None
+                if self.__socket:
+                    self.__socket.close()
+                    self.__socket = None
+                time.sleep(5)
+                try:
+                    self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.__socket.settimeout(60)
+                    self.__socket.connect((self.host, self.port))
+                    self.__stream = self.__socket.makefile(mode='r')
+                    logging.info('[WARDRIVER] Reconnected to gps2ip socket')
+                except Exception as reconnect_err:
+                    logging.error(f'[WARDRIVER] gps2ip reconnect failed: {reconnect_err}')
+
 # Credits to Jayofelony: https://github.com/jayofelony/pwnagotchi-torch-plugins/blob/main/pwndroid.py
 class PwndroidClient:
     DEFAULT_HOST = '192.168.44.1'
@@ -369,7 +487,7 @@ class PwndroidClient:
         }
         self.__destroy = False
         self.__websocket = None
-    
+
     async def connect(self):
         while not self.__websocket and not self.__destroy:
             try:
@@ -380,7 +498,7 @@ class PwndroidClient:
                 logging.critical('[WARDRIVER] Failed to connect to pwndroid websocket')
                 self.__websocket = None
                 await asyncio.sleep(10) # Wait 10 seconds between each retry
-    
+
     async def disconnect(self):
         if self.__websocket:
             await self.__websocket.close()
@@ -389,10 +507,10 @@ class PwndroidClient:
             self.__destroy = True
         else:
             logging.debug('[WARDRIVER] Cannot close websocket connection. No connection estabilished')
-    
+
     def is_connected(self):
         return self.__websocket is not None
-    
+
     async def __get_gps_coordinates(self):
         while self.__websocket:
             try:
@@ -439,6 +557,9 @@ class Wardriver(plugins.Plugin):
         self.__db = None
         self.__current_icon = ""
         self.ready = False
+        self.__gpsd_client = None
+        self.__gps2ip_client = None
+        self.__pwndroid_client = None
         self.__downloaded_assets = True
         self.__agent_mode = None
         self.__last_gps = {
@@ -446,7 +567,7 @@ class Wardriver(plugins.Plugin):
             "longitude": '-',
             "altitude": '-'
         }
-    
+
     def on_loaded(self):
         logging.info('[WARDRIVER] Plugin loaded (join the Discord server: https://discord.gg/5vrJbbW3ve)')
 
@@ -457,17 +578,17 @@ class Wardriver(plugins.Plugin):
             self.__path = self.options['path']
         except Exception:
             self.__path = self.DEFAULT_PATH
-        
+
         try:
             self.__ui_enabled = self.options['ui']['enabled']
         except Exception:
             self.__ui_enabled = False
-        
+
         try:
             self.__icon = self.options['ui']['icon']
         except Exception:
             self.__icon = True
-        
+
         self.__assets_path = os.path.join(os.path.dirname(__file__), "wardriver_assets")
         os.makedirs(self.__assets_path, exist_ok=True)
         for asset in self.ASSETS_URL:
@@ -475,7 +596,7 @@ class Wardriver(plugins.Plugin):
                 logging.critical(f'[WARDRIVER] Asset {asset["name"]} is missing. Once internet is available it will be downloaded from GitHub')
                 self.__downloaded_assets = False
                 self.__icon = False
-        
+
         try:
             self.__reverse = self.options['ui']['icon_reverse']
         except Exception:
@@ -485,7 +606,27 @@ class Wardriver(plugins.Plugin):
             self.__ui_position = (self.options['ui']['position']['x'], self.options['ui']['position']['y'])
         except Exception:
             self.__ui_position = (7, 95)
-        
+
+        try:
+            self.__ui_lat_enabled = self.options['ui']['latitude']['enabled']
+        except Exception:
+            self.__ui_lat_enabled = False
+
+        try:
+            self.__ui_lat_position = (self.options['ui']['latitude']['position']['x'], self.options['ui']['latitude']['position']['y'])
+        except Exception:
+            self.__ui_lat_position = (7, 107)
+
+        try:
+            self.__ui_lon_enabled = self.options['ui']['longitude']['enabled']
+        except Exception:
+            self.__ui_lon_enabled = False
+
+        try:
+            self.__ui_lon_position = (self.options['ui']['longitude']['position']['x'], self.options['ui']['longitude']['position']['y'])
+        except Exception:
+            self.__ui_lon_position = (7, 117)
+
         try:
             self.__whitelist = self.options['whitelist']
         except Exception:
@@ -501,26 +642,26 @@ class Wardriver(plugins.Plugin):
             self.__wigle_donate = False
         try:
             self.__wigle_enabled = self.options['wigle']['enabled']
-            
+
             if self.__wigle_enabled and (not self.__wigle_api_key or self.__wigle_api_key == ''):
                 logging.error('[WARDRIVER] Wigle enabled but no api key provided!')
                 self.__wigle_enabled = False
         except Exception:
             self.__wigle_enabled = False
-        
+
         self.__gps_config = dict()
         try:
             self.__gps_config['method'] = self.options['gps']['method']
-            if self.__gps_config['method'] not in ['bettercap', 'gpsd', 'pwndroid']:
+            if self.__gps_config['method'] not in ['bettercap', 'gpsd', 'pwndroid', 'gps2ip']:
                 logging.critical('[WARDRIVER] Invalid GPS method provided! Switching back to bettercap (default)')
                 raise Error()
         except:
             self.__gps_config['method'] = 'bettercap'
-        
+
         if not os.path.exists(self.__path):
             os.makedirs(self.__path)
             logging.warning('[WARDRIVER] Created db directory')
-        
+
         self.__db = Database(os.path.join(self.__path, self.DATABASE_NAME))
         self.__csv_generator = CSVGenerator()
         self.__session_reported = []
@@ -528,18 +669,16 @@ class Wardriver(plugins.Plugin):
         self.__last_ap_reported = []
 
         logging.info(f'[WARDRIVER] Wardriver DB can be found in {self.__path}')
-        
+
         self.__load_global_whitelist()
         if len(self.__whitelist) > 0:
             logging.info(f'[WARDRIVER] Ignoring {len(self.__whitelist)} networks')
-        
+
         if self.__wigle_enabled:
             logging.info('[WARDRIVER] Previous sessions will be uploaded to WiGLE once internet is available')
             logging.info('[WARDRIVER] Join the WiGLE group: search "The crew of the Black Pearl" and start wardriving with us!')
 
         self.__session_id = self.__db.new_wardriving_session()
-
-        self.ready = True
 
         if self.__gps_config['method'] == 'gpsd':
             try:
@@ -566,10 +705,24 @@ class Wardriver(plugins.Plugin):
                 asyncio.run(self.__pwndroid_client.connect())
             except Exception as e:
                 logging.critical(f'[WARDRIVER] Unexpected error while connecting to pwndroid. Error: {e}')
-    
+        elif self.__gps_config['method'] == 'gps2ip':
+            try:
+                self.__gps_config['host'] = self.options['gps']['host']
+                self.__gps_config['port'] = self.options['gps']['port']
+            except Exception:
+                self.__gps_config['host'] = Gps2IpClient.DEFAULT_HOST
+                self.__gps_config['port'] = Gps2IpClient.DEFAULT_PORT
+
+            try:
+                self.__gps2ip_client = Gps2IpClient(host=self.__gps_config['host'], port=self.__gps_config['port'])
+                self.__gps2ip_client.connect()
+            except Exception:
+                logging.critical('[WARDRIVER] Failed connecting to gps2ip. Will try again soon.')
+        self.ready = True
+
     def on_ready(self, agent):
         self.__agent_mode = agent.mode
-        
+
     def __load_global_whitelist(self):
         try:
             with open('/etc/pwnagotchi/config.toml', 'r') as config_file:
@@ -579,7 +732,7 @@ class Wardriver(plugins.Plugin):
                         self.__whitelist.append(ssid)
         except Exception as e:
             logging.critical('[WARDRIVER] Cannot read global config. Networks in global whitelist will NOT be ignored')
-    
+
     def on_ui_setup(self, ui):
         if self.__ui_enabled:
             logging.info('[WARDRIVER] Adding status text to ui')
@@ -591,14 +744,40 @@ class Wardriver(plugins.Plugin):
                                             position = wardriver_text_pos,
                                             label_font = fonts.Small,
                                             text_font = fonts.Small))
-            
+
             if self.__icon:
                 ui.add_element('wardriver_icon', WardriverIcon(path = f'{self.__assets_path}/icon_working.bmp', xy = self.__ui_position, reverse = self.__reverse))
                 self.__current_icon = 'icon_working'
 
+            if self.__ui_lat_enabled:
+                ui.add_element('wardriver_lat', LabeledValue(color = BLACK,
+                                                label = 'lat:',
+                                                value = '-',
+                                                position = self.__ui_lat_position,
+                                                label_font = fonts.Small,
+                                                text_font = fonts.Small))
+
+            if self.__ui_lon_enabled:
+                ui.add_element('wardriver_lon', LabeledValue(color = BLACK,
+                                                label = 'lon:',
+                                                value = '-',
+                                                position = self.__ui_lon_position,
+                                                label_font = fonts.Small,
+                                                text_font = fonts.Small))
+
     def on_ui_update(self, ui):
         if self.__gps_config['method'] == 'gpsd' and self.ready:
             self.__gpsd_client.get_coordinates() # Poll to keep the socket open
+        if self.__ui_enabled and self.ready and self.__ui_lat_enabled:
+            try:
+                ui.set('wardriver_lat', f'{float(self.__last_gps["latitude"]):.5f}')
+            except Exception:
+                ui.set('wardriver_lat', f'{self.__last_gps["latitude"]}')
+        if self.__ui_enabled and self.ready and self.__ui_lon_enabled:
+            try:
+                ui.set('wardriver_lon', f'{float(self.__last_gps["longitude"]):.5f}')
+            except Exception:
+                ui.set('wardriver_lon', f'{self.__last_gps["longitude"]}')
         if self.__ui_enabled and self.ready and self.__agent_mode and self.__agent_mode != "manual":
             ui.set('wardriver', f'{self.__db.session_networks_count(self.__session_id)} {"networks" if self.__icon else "nets"}')
             if self.__gps_available and self.__current_icon == 'icon_error':
@@ -616,8 +795,14 @@ class Wardriver(plugins.Plugin):
                 ui.remove_element('wardriver')
                 if self.__icon:
                     ui.remove_element('wardriver_icon')
+                if self.__ui_lat_enabled:
+                    ui.remove_element('wardriver_lat')
+                if self.__ui_lon_enabled:
+                    ui.remove_element('wardriver_lon')
         if self.__gps_config['method'] == 'gpsd':
             self.__gpsd_client.disconnect()
+        if self.__gps_config['method'] == 'gps2ip':
+            self.__gps2ip_client.disconnect()
         if self.__gps_config['method'] == 'pwndroid':
             asyncio.run(self.__pwndroid_client.disconnect())
         self.__db.disconnect()
@@ -629,7 +814,7 @@ class Wardriver(plugins.Plugin):
         '''
         filtered_aps = [ ap for ap in unfiltered_aps if ap['hostname'] not in self.__whitelist ]
         return filtered_aps
-    
+
     def __filter_reported_aps(self, unfiltered_aps):
         '''
         Filter already reported networks
@@ -642,7 +827,7 @@ class Wardriver(plugins.Plugin):
         if not self.ready: # it is ready once the session file has been initialized with pre-header and header
             logging.error('[WARDRIVER] Plugin not ready... skip wardriving log')
             return
-        
+
         if self.__gps_config['method'] == 'bettercap':
             info = agent.session()
             gps_data = info["gps"]
@@ -652,12 +837,16 @@ class Wardriver(plugins.Plugin):
                 gps_data = self.__gpsd_client.get_coordinates()
             except:
                gps_data = None
-        
+
         if self.__gps_config['method'] == 'pwndroid':
             if self.__pwndroid_client.is_connected():
                 gps_data = self.__pwndroid_client.coordinates
 
-        if gps_data and all([ gps_data["Latitude"], gps_data["Longitude"] ]):
+        if self.__gps_config['method'] == 'gps2ip':
+            if self.__gps2ip_client.coordinates['Latitude'] is not None:
+                gps_data = self.__gps2ip_client.coordinates
+
+        if gps_data and gps_data.get("Latitude") is not None and gps_data.get("Longitude") is not None:
             self.__gps_available = True
             self.__last_ap_refresh = datetime.now()
             self.__last_ap_reported = []
@@ -674,7 +863,7 @@ class Wardriver(plugins.Plugin):
 
             filtered_aps = self.__filter_whitelist_aps(aps)
             filtered_aps = self.__filter_reported_aps(filtered_aps)
-            
+
             if len(filtered_aps) > 0:
                 logging.info(f'[WARDRIVER] Discovered {len(filtered_aps)} new networks')
                 for ap in filtered_aps:
@@ -713,7 +902,7 @@ class Wardriver(plugins.Plugin):
             self.__last_gps['longitude'] = '-'
             self.__last_gps['altitude'] = '-'
             logging.warning("[WARDRIVER] GPS not available... skip wardriving log")
-        
+
     def __upload_session_to_wigle(self, session_id):
         if self.__wigle_api_key != '':
             headers = {
@@ -722,7 +911,7 @@ class Wardriver(plugins.Plugin):
             }
             networks = self.__db.session_networks(session_id)
             csv = self.__csv_generator.networks_to_wigle_csv(networks)
-            
+
             data = {
                 'donate': 'on' if self.__wigle_donate else 'off'
             }
@@ -748,7 +937,7 @@ class Wardriver(plugins.Plugin):
                 return False
         else:
             return False
-    
+
     def on_internet_available(self, agent):
         if not self.__lock.locked() and self.ready:
             with self.__lock:
@@ -772,7 +961,7 @@ class Wardriver(plugins.Plugin):
 
                         for session_id in sessions_to_upload:
                             self.__upload_session_to_wigle(session_id)
-    
+
     def on_webhook(self, path, request):
         if request.method == 'GET':
             if path == '/' or not path:
@@ -1085,7 +1274,7 @@ HTML_PAGE = '''
                                 <th scope="col">Actions</th>
                             </thead>
                             <tbody id="sessions-table">
-    
+
                             </tbody>
                         </table>
                     </div>
@@ -1105,7 +1294,7 @@ HTML_PAGE = '''
                                 <th scope="col"># sessions</th>
                             </thead>
                             <tbody id="networks-table">
-    
+
                             </tbody>
                         </table>
                     </div>
@@ -1141,20 +1330,20 @@ HTML_PAGE = '''
             request("GET", "/plugins/wardriver/csv/" + session_id, function(text) {
                 const blob = new Blob([text], { type: 'text/csv' })
 
-                // Creating an object for downloading url 
-                const url = window.URL.createObjectURL(blob) 
+                // Creating an object for downloading url
+                const url = window.URL.createObjectURL(blob)
 
-                // Creating an anchor(a) tag of HTML 
+                // Creating an anchor(a) tag of HTML
                 const a = document.createElement('a')
 
-                // Passing the blob downloading url  
-                a.setAttribute('href', url) 
+                // Passing the blob downloading url
+                a.setAttribute('href', url)
 
-                // Setting the anchor tag attribute for downloading 
-                // and passing the download file name 
+                // Setting the anchor tag attribute for downloading
+                // and passing the download file name
                 a.setAttribute('download', 'session.csv')
 
-                // Performing a download with click 
+                // Performing a download with click
                 a.click()
             })
         }
@@ -1219,7 +1408,7 @@ HTML_PAGE = '''
         }
 
         setInterval(getCurrentSessionStats, 30 * 1000) // refresh current session data every 30s
-        
+
         // Make HTTP request to pwnagotchi "server"
         function request(method, url, callback) {
             var xobj = new XMLHttpRequest();
@@ -1232,7 +1421,7 @@ HTML_PAGE = '''
                         response = JSON.parse(xobj.responseText)
                     }
                     catch(error) {
-                        
+
                     }
                     callback(response)
                 }
@@ -1305,7 +1494,7 @@ HTML_PAGE = '''
                     port.innerHTML = "Port: <code>" + data.config.gps.port + "</code>"
                     document.getElementById("config-gps").appendChild(port)
                 }
-                
+
                 if(data.config.wigle_api_key) {
                     loadWigleStats(data.config.wigle_api_key, function(stats) {
                         document.getElementById("wigle-username").innerText = stats.user
@@ -1429,7 +1618,7 @@ HTML_PAGE = '''
                 n[key].push(network)
                 return n
             }, Object.create(null))
-            
+
             var markers = []
             var mapCenter
             Object.keys(networksGrouped).forEach(key => {
@@ -1445,7 +1634,7 @@ HTML_PAGE = '''
                         popupText += "<b>Hidden</b>"
                     else
                         popupText += "<b>" + network.ssid + "</b>"
-                    
+
                     popupText += " (" + network.mac + ")<br />"
                     popupCounter++
                 }

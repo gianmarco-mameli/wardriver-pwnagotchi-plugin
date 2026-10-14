@@ -25,7 +25,7 @@ A complete plugin for wardriving on your pwnagotchi. It saves all networks seen 
 
 > [!IMPORTANT]
 > This plugin require a GPS module attached to your pwnagotchi to work, or your pwnagotchi needs to be connected via BT to your Android phone with Pwndroid application installed.
-> 
+>
 > Depending on the GPS method choosen, you'll also need the `gps` or `gpsdeasy` or `pwndroid` plugin enabled. For more info about GPS configuration, check the [section](#-gps-configuration) below.
 
 1. Login inside your pwnagotchi using SSH:
@@ -95,6 +95,7 @@ Starting from version v2.3, Wardriver supports different methods to retrieve the
 - **Bettercap**: getting the position directly from Bettercap's agent
 - **GPSD**: getting the position from GPSD daemon
 - **Pwndroid**: getting the position from pwndroid Android companion application
+- **Serial**: reading NMEA directly from a USB or UART GPS receiver
 
 Check one of the below section to understand how to configure each method for GPS position.
 
@@ -145,6 +146,20 @@ main.plugins.wardriver.gps.host = "192.168.44.1"
 main.plugins.wardriver.gps.port = 8080
 # ...
 ```
+#### Serial GPS
+
+Install PySerial in the Python environment used by Pwnagotchi (on Debian-based images: `sudo apt install python3-serial`).
+
+```toml
+main.plugins.wardriver.gps.method = "serial"
+main.plugins.wardriver.gps.device = "/dev/ttyUSB0"
+main.plugins.wardriver.gps.baudrate = 9600
+```
+
+Set the device path and baud rate to match your receiver. USB receivers may use `/dev/ttyACM0`; Raspberry Pi UART receivers may use `/dev/serial0`. The service user must have permission to access the device, and GPSD or another plugin must not open the same port.
+
+The reader supports GP/GN GGA and RMC NMEA sentences, retries device failures every 5 seconds, and clears cached coordinates after 60 seconds without a valid fix. It runs in the background and uses the existing latitude/longitude display options.
+
 ### 🗺️ Wigle configuration
 
 In order to be able to upload your discovered networks to WiGLE, you need to register a valid API key for your account. Follow these steps to get your key:

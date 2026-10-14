@@ -3,7 +3,7 @@ import sqlite3
 import os
 from datetime import datetime, timezone
 import toml
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 import json
 import requests
 from PIL import Image, ImageOps
@@ -409,7 +409,7 @@ class Gps2IpClient():
             decimal = -decimal
         return decimal
 
-    def __parse_nmea(self, sentence):
+    def _parse_nmea(self, sentence):
         if not sentence:
             return None
         payload = sentence.split('*')[0]
@@ -445,7 +445,7 @@ class Gps2IpClient():
                 sentence = line.strip().replace('\x00', '')
                 if not sentence or not sentence.startswith('$'):
                     continue
-                parsed = self.__parse_nmea(sentence)
+                parsed = self._parse_nmea(sentence)
                 if parsed and parsed['Latitude'] is not None and parsed['Longitude'] is not None:
                     self.coordinates['Latitude'] = parsed['Latitude']
                     self.coordinates['Longitude'] = parsed['Longitude']
@@ -470,6 +470,86 @@ class Gps2IpClient():
                     logging.info('[WARDRIVER] Reconnected to gps2ip socket')
                 except Exception as reconnect_err:
                     logging.error(f'[WARDRIVER] gps2ip reconnect failed: {reconnect_err}')
+
+class SerialGpsClient(Gps2IpClient):
+    DEFAULT_DEVICE = '/dev/ttyUSB0'
+    DEFAULT_BAUDRATE = 9600
+
+    def __init__(self, device, baudrate):
+        super().__init__(None, None)
+        self.device = device
+        self.baudrate = baudrate
+        self.__stop = Event()
+        self.__lock = Lock()
+        self.__thread = None
+        self.__last_update = None
+
+    def connect(self):
+        try:
+            import serial
+        except ImportError:
+            logging.error('[WARDRIVER] Serial GPS requires pyserial (python3-serial)')
+            return
+        if self.__thread and self.__thread.is_alive():
+            return
+        self.__stop.clear()
+        self.__thread = Thread(target=self.__read_loop, args=(serial,), daemon=True)
+        self.__thread.start()
+
+    def disconnect(self):
+        self.__stop.set()
+        if self.__thread:
+            self.__thread.join(timeout=2)
+        with self.__lock:
+            self.coordinates = {'Latitude': None, 'Longitude': None, 'Altitude': None}
+            self.__last_update = None
+
+    def get_coordinates(self):
+        with self.__lock:
+            if self.__last_update is None or time.monotonic() - self.__last_update >= 60:
+                self.coordinates = {'Latitude': None, 'Longitude': None, 'Altitude': None}
+                return None
+            return self.coordinates.copy()
+
+    def __read_loop(self, serial):
+        while not self.__stop.is_set():
+            try:
+                with serial.Serial(self.device, self.baudrate, timeout=1) as port:
+                    logging.info(f'[WARDRIVER] Connected to serial GPS on {self.device}')
+                    buffer = b''
+                    while not self.__stop.is_set():
+                        buffer += port.readline()
+                        self.get_coordinates()
+                        while b'\n' in buffer:
+                            raw, buffer = buffer.split(b'\n', 1)
+                            sentence = raw.decode('ascii', errors='ignore').strip()
+                            fields = sentence.split('*')[0].split(',')
+                            if len(fields) < 7:
+                                continue
+                            if fields[0] in ['$GPGGA', '$GNGGA']:
+                                if fields[6] not in ['1', '2', '3', '4', '5', '6']:
+                                    continue
+                            elif fields[0] in ['$GPRMC', '$GNRMC']:
+                                if fields[2] != 'A':
+                                    continue
+                            else:
+                                continue
+                            try:
+                                parsed = self._parse_nmea(sentence)
+                            except (ValueError, IndexError):
+                                continue
+                            if parsed is not None:
+                                if parsed['Altitude'] is None:
+                                    parsed['Altitude'] = 0.0
+                                with self.__lock:
+                                    self.coordinates = parsed
+                                    self.__last_update = time.monotonic()
+                        if len(buffer) > 4096:
+                            buffer = b''
+            except (OSError, serial.SerialException, ValueError) as error:
+                logging.warning(f'[WARDRIVER] Serial GPS error: {error}. Retrying in 5s')
+                self.get_coordinates()
+                self.__stop.wait(5)
 
 # Credits to Jayofelony: https://github.com/jayofelony/pwnagotchi-torch-plugins/blob/main/pwndroid.py
 class PwndroidClient:
@@ -558,6 +638,7 @@ class Wardriver(plugins.Plugin):
         self.ready = False
         self.__gpsd_client = None
         self.__gps2ip_client = None
+        self.__serial_client = None
         self.__pwndroid_client = None
         self.__downloaded_assets = True
         self.__agent_mode = None
@@ -651,7 +732,7 @@ class Wardriver(plugins.Plugin):
         self.__gps_config = dict()
         try:
             self.__gps_config['method'] = self.options['gps']['method']
-            if self.__gps_config['method'] not in ['bettercap', 'gpsd', 'pwndroid', 'gps2ip']:
+            if self.__gps_config['method'] not in ['bettercap', 'gpsd', 'pwndroid', 'gps2ip', 'serial']:
                 logging.critical('[WARDRIVER] Invalid GPS method provided! Switching back to bettercap (default)')
                 raise Error()
         except:
@@ -717,6 +798,12 @@ class Wardriver(plugins.Plugin):
                 self.__gps2ip_client.connect()
             except Exception:
                 logging.critical('[WARDRIVER] Failed connecting to gps2ip. Will try again soon.')
+        elif self.__gps_config['method'] == 'serial':
+            options = self.options.get('gps', {})
+            self.__gps_config['device'] = options.get('device', SerialGpsClient.DEFAULT_DEVICE)
+            self.__gps_config['baudrate'] = options.get('baudrate', SerialGpsClient.DEFAULT_BAUDRATE)
+            self.__serial_client = SerialGpsClient(self.__gps_config['device'], self.__gps_config['baudrate'])
+            self.__serial_client.connect()
         self.ready = True
 
     def on_ready(self, agent):
@@ -767,6 +854,11 @@ class Wardriver(plugins.Plugin):
     def on_ui_update(self, ui):
         if self.__gps_config['method'] == 'gpsd' and self.ready:
             self.__gpsd_client.get_coordinates() # Poll to keep the socket open
+        if self.ready and self.__gps_config['method'] == 'serial':
+            gps_data = self.__serial_client.get_coordinates()
+            self.__gps_available = gps_data is not None
+            for coordinate in ['latitude', 'longitude', 'altitude']:
+                self.__last_gps[coordinate] = gps_data[coordinate.capitalize()] if gps_data else '-'
         if self.__ui_enabled and self.ready and self.__ui_lat_enabled:
             try:
                 ui.set('wardriver_lat', f'{float(self.__last_gps["latitude"]):.5f}')
@@ -802,6 +894,8 @@ class Wardriver(plugins.Plugin):
             self.__gpsd_client.disconnect()
         if self.__gps_config['method'] == 'gps2ip':
             self.__gps2ip_client.disconnect()
+        if self.__gps_config['method'] == 'serial':
+            self.__serial_client.disconnect()
         if self.__gps_config['method'] == 'pwndroid':
             asyncio.run(self.__pwndroid_client.disconnect())
         self.__db.disconnect()
@@ -844,6 +938,9 @@ class Wardriver(plugins.Plugin):
         if self.__gps_config['method'] == 'gps2ip':
             if self.__gps2ip_client.coordinates['Latitude'] is not None:
                 gps_data = self.__gps2ip_client.coordinates
+
+        if self.__gps_config['method'] == 'serial':
+            gps_data = self.__serial_client.get_coordinates()
 
         if gps_data and gps_data.get("Latitude") is not None and gps_data.get("Longitude") is not None:
             self.__gps_available = True
@@ -1485,7 +1582,14 @@ HTML_PAGE = '''
                 var gps_method = document.createElement("li")
                 gps_method.innerHTML = "Method: <code>" + data.config.gps.method + "</code>"
                 document.getElementById("config-gps").appendChild(gps_method)
-                if(data.config.gps.method != "bettercap") {
+                if(data.config.gps.method == "serial") {
+                    for(var setting of ["device", "baudrate"]) {
+                        var item = document.createElement("li")
+                        item.innerText = setting + ": " + data.config.gps[setting]
+                        document.getElementById("config-gps").appendChild(item)
+                    }
+                }
+                else if(data.config.gps.method != "bettercap") {
                     var host = document.createElement("li")
                     host.innerHTML = "Host: <code>" + data.config.gps.host + "</code>"
                     document.getElementById("config-gps").appendChild(host)

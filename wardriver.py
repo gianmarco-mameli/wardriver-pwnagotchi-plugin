@@ -506,8 +506,16 @@ class SerialGpsClient(Gps2IpClient):
 
     def get_coordinates(self):
         with self.__lock:
-            if self.__last_update is None or time.monotonic() - self.__last_update >= 60:
+            try:
+                latitude = float(self.coordinates['Latitude'])
+                longitude = float(self.coordinates['Longitude'])
+                valid = (-90 <= latitude <= 90 and -180 <= longitude <= 180
+                         and not (latitude == 0 and longitude == 0))
+            except (TypeError, ValueError):
+                valid = False
+            if not valid or self.__last_update is None or time.monotonic() - self.__last_update >= 60:
                 self.coordinates = {'Latitude': None, 'Longitude': None, 'Altitude': None}
+                self.__last_update = None
                 return None
             return self.coordinates.copy()
 

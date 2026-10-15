@@ -511,6 +511,34 @@ class SerialGpsClient(Gps2IpClient):
                 return None
             return self.coordinates.copy()
 
+    def _parse_nmea(self, sentence):
+        fields = sentence.split('*')[0].split(',')
+        try:
+            if fields[0] in ['$GPGGA', '$GNGGA']:
+                if fields[6] not in ['1', '2', '3', '4', '5'] or int(fields[7]) <= 0:
+                    return None
+                latitude, north_south, longitude, east_west = fields[2:6]
+            elif fields[0] in ['$GPRMC', '$GNRMC']:
+                if fields[2] != 'A':
+                    return None
+                latitude, north_south, longitude, east_west = fields[3:7]
+            else:
+                return None
+            if north_south not in ['N', 'S'] or east_west not in ['E', 'W']:
+                return None
+            if not (0 <= float(latitude) % 100 < 60 and 0 <= float(longitude) % 100 < 60):
+                return None
+            parsed = super()._parse_nmea(sentence)
+            if parsed is None:
+                return None
+            if not (-90 <= parsed['Latitude'] <= 90 and -180 <= parsed['Longitude'] <= 180):
+                return None
+            if parsed['Latitude'] == 0 and parsed['Longitude'] == 0:
+                return None
+            return parsed
+        except (ValueError, IndexError):
+            return None
+
     def __read_loop(self, serial):
         while not self.__stop.is_set():
             try:
@@ -524,19 +552,13 @@ class SerialGpsClient(Gps2IpClient):
                             raw, buffer = buffer.split(b'\n', 1)
                             sentence = raw.decode('ascii', errors='ignore').strip()
                             fields = sentence.split('*')[0].split(',')
-                            if len(fields) < 7:
+                            if fields[0] not in ['$GPGGA', '$GNGGA', '$GPRMC', '$GNRMC']:
                                 continue
-                            if fields[0] in ['$GPGGA', '$GNGGA']:
-                                if fields[6] not in ['1', '2', '3', '4', '5', '6']:
-                                    continue
-                            elif fields[0] in ['$GPRMC', '$GNRMC']:
-                                if fields[2] != 'A':
-                                    continue
-                            else:
-                                continue
-                            try:
-                                parsed = self._parse_nmea(sentence)
-                            except (ValueError, IndexError):
+                            parsed = self._parse_nmea(sentence)
+                            if parsed is None:
+                                with self.__lock:
+                                    self.coordinates = {'Latitude': None, 'Longitude': None, 'Altitude': None}
+                                    self.__last_update = None
                                 continue
                             if parsed is not None:
                                 if parsed['Altitude'] is None:

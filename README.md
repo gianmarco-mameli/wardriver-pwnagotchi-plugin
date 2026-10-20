@@ -95,6 +95,7 @@ Starting from version v2.3, Wardriver supports different methods to retrieve the
 - **Bettercap**: getting the position directly from Bettercap's agent
 - **GPSD**: getting the position from GPSD daemon
 - **Pwndroid**: getting the position from pwndroid Android companion application
+- **gps2ip**: reading a TCP NMEA stream from the gps2ip phone application
 - **Serial**: reading NMEA directly from a USB or UART GPS receiver
 
 Check one of the below section to understand how to configure each method for GPS position.
@@ -146,6 +147,18 @@ main.plugins.wardriver.gps.host = "192.168.44.1"
 main.plugins.wardriver.gps.port = 8080
 # ...
 ```
+#### gps2ip
+
+Enable the TCP NMEA server in gps2ip and configure the phone's reachable IP address and listening port:
+
+```toml
+main.plugins.wardriver.gps.method = "gps2ip"
+main.plugins.wardriver.gps.host = "172.20.10.1"
+main.plugins.wardriver.gps.port = 11123
+```
+
+Connections run in the background with a 5-second connection timeout. Failed initial connections and dropped connections retry every 5 seconds until the plugin is unloaded. Connections that send no data for 60 seconds are reopened. Cached coordinates and altitude are cleared on disconnect or after 60 seconds without a valid fix, so old positions are not logged during an outage. Malformed NMEA sentences are skipped without reconnecting.
+
 #### Serial GPS
 
 Install PySerial in the Python environment used by Pwnagotchi (on Debian-based images: `sudo apt install python3-serial`).

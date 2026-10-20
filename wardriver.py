@@ -357,6 +357,11 @@ class GpsdClient():
 class Gps2IpClient():
     DEFAULT_HOST = '172.20.10.1'
     DEFAULT_PORT = 11123
+    CONNECT_TIMEOUT = 5
+    READ_TIMEOUT = 1
+    STALE_TIMEOUT = 60
+    RETRY_DELAY = 5
+    MAX_BUFFER_SIZE = 8192
 
     def __init__(self, host, port):
         self.host = host
@@ -367,38 +372,117 @@ class Gps2IpClient():
             'Altitude': None
         }
         self.__socket = None
-        self.__stream = None
         self.__last_altitude = None
-        self.__running = False
+        self.__last_update = None
+        self.__stop = Event()
+        self.__lock = Lock()
+        self.__lifecycle_lock = Lock()
+        self.__connected = False
         self.__thread = None
 
     def connect(self):
-        logging.debug('[WARDRIVER] Connecting to gps2ip socket')
-        try:
-            self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.__socket.settimeout(60)
-            self.__socket.connect((self.host, self.port))
-            self.__stream = self.__socket.makefile(mode='r')
-            self.__running = True
+        with self.__lifecycle_lock:
+            if self.__thread and self.__thread.is_alive():
+                return
+            self.__stop.clear()
             self.__thread = Thread(target=self.__read_loop, daemon=True)
             self.__thread.start()
-            logging.info('[WARDRIVER] Connected to gps2ip socket')
-        except Exception as e:
-            logging.critical(f'[WARDRIVER] Failed to connect to gps2ip socket: {e}')
-            self.__socket = None
-            self.__stream = None
 
     def disconnect(self):
-        self.__running = False
-        if self.__stream:
-            self.__stream.close()
-            self.__stream = None
-        if self.__socket:
-            self.__socket.close()
-            self.__socket = None
+        with self.__lifecycle_lock:
+            self.__stop.set()
+            with self.__lock:
+                connection = self.__socket
+                self.__connected = False
+                self.__clear_coordinates()
+            if connection is not None:
+                # Wake a blocked recv before waiting for the worker to exit.
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError as e:
+                    logging.debug(f'[WARDRIVER] gps2ip shutdown: {e}')
+                connection.close()
+            if self.__thread:
+                self.__thread.join(timeout=self.CONNECT_TIMEOUT + 2)
+                if self.__thread.is_alive():
+                    logging.error('[WARDRIVER] gps2ip worker did not stop in time')
 
     def is_connected(self):
-        return self.__running and self.__thread is not None and self.__thread.is_alive()
+        with self.__lock:
+            return self.__connected and not self.__stop.is_set()
+
+    def get_coordinates(self):
+        with self.__lock:
+            if self.__last_update is None:
+                return None
+            if time.monotonic() - self.__last_update >= self.STALE_TIMEOUT:
+                logging.warning('[WARDRIVER] gps2ip fix expired, clearing cached coordinates')
+                self.__clear_coordinates()
+                return None
+            return self.coordinates.copy()
+
+    def __read_loop(self):
+        while not self.__stop.is_set():
+            connection = None
+            try:
+                connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                with self.__lock:
+                    self.__socket = connection
+                connection.settimeout(self.CONNECT_TIMEOUT)
+                connection.connect((self.host, self.port))
+                connection.settimeout(self.READ_TIMEOUT)
+                with self.__lock:
+                    if self.__stop.is_set():
+                        break
+                    self.__connected = True
+                logging.info('[WARDRIVER] Connected to gps2ip socket')
+                buffer = b''
+                last_received = time.monotonic()
+                while not self.__stop.is_set():
+                    self.get_coordinates()
+                    if time.monotonic() - last_received >= self.STALE_TIMEOUT:
+                        raise TimeoutError('no gps2ip data for 60s')
+                    try:
+                        data = connection.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        raise ConnectionError('gps2ip stream closed')
+                    last_received = time.monotonic()
+                    buffer += data
+                    while b'\n' in buffer:
+                        raw, buffer = buffer.split(b'\n', 1)
+                        self.__process_sentence(raw)
+                    if len(buffer) > self.MAX_BUFFER_SIZE:
+                        logging.warning('[WARDRIVER] Discarding oversized gps2ip sentence')
+                        buffer = b''
+            except OSError as e:
+                if not self.__stop.is_set():
+                    logging.warning(f'[WARDRIVER] gps2ip connection failed: {e}. Retrying in {self.RETRY_DELAY}s')
+            finally:
+                with self.__lock:
+                    self.__connected = False
+                    self.__socket = None
+                    self.__clear_coordinates()
+                if connection is not None:
+                    connection.close()
+            if self.__stop.wait(self.RETRY_DELAY):
+                break
+
+    def __process_sentence(self, raw):
+        try:
+            sentence = raw.decode('ascii').strip().replace('\x00', '')
+            if not sentence.startswith('$'):
+                return
+            with self.__lock:
+                if self.__stop.is_set():
+                    return
+                parsed = self._parse_nmea(sentence)
+                if parsed is not None:
+                    self.coordinates = parsed
+                    self.__last_update = time.monotonic()
+        except (UnicodeError, ValueError, OverflowError, IndexError) as e:
+            logging.debug(f'[WARDRIVER] Ignoring malformed gps2ip sentence: {e}')
 
     def __nmea_to_decimal(self, coordinate, hemisphere):
         value = float(coordinate)
@@ -418,58 +502,33 @@ class Gps2IpClient():
             return None
         sentence_type = fields[0]
         if sentence_type in ['$GPGGA', '$GNGGA'] and len(fields) > 9:
+            if fields[6] not in ['1', '2', '3', '4', '5'] or int(fields[7]) <= 0:
+                return None
+            if fields[3] not in ['N', 'S'] or fields[5] not in ['E', 'W']:
+                return None
             latitude = self.__nmea_to_decimal(fields[2], fields[3])
             longitude = self.__nmea_to_decimal(fields[4], fields[5])
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                return None
             altitude = self.__last_altitude
             if fields[9] != '':
                 altitude = float(fields[9])
             self.__last_altitude = altitude
             return {'Latitude': latitude, 'Longitude': longitude, 'Altitude': altitude}
         if sentence_type in ['$GPRMC', '$GNRMC'] and len(fields) > 6:
+            if fields[2] != 'A' or fields[4] not in ['N', 'S'] or fields[6] not in ['E', 'W']:
+                return None
             latitude = self.__nmea_to_decimal(fields[3], fields[4])
             longitude = self.__nmea_to_decimal(fields[5], fields[6])
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                return None
             return {'Latitude': latitude, 'Longitude': longitude, 'Altitude': self.__last_altitude}
         return None
 
     def __clear_coordinates(self):
-        self.coordinates['Latitude'] = None
-        self.coordinates['Longitude'] = None
-        self.coordinates['Altitude'] = None
-
-    def __read_loop(self):
-        while self.__running:
-            try:
-                line = self.__stream.readline()
-                if not line:
-                    raise Exception('gps2ip stream closed')
-                sentence = line.strip().replace('\x00', '')
-                if not sentence or not sentence.startswith('$'):
-                    continue
-                parsed = self._parse_nmea(sentence)
-                if parsed and parsed['Latitude'] is not None and parsed['Longitude'] is not None:
-                    self.coordinates['Latitude'] = parsed['Latitude']
-                    self.coordinates['Longitude'] = parsed['Longitude']
-                    self.coordinates['Altitude'] = parsed['Altitude']
-            except socket.timeout:
-                logging.warning('[WARDRIVER] gps2ip no data for 60s, clearing cached coordinates')
-                self.__clear_coordinates()
-            except Exception as e:
-                logging.error(f'[WARDRIVER] gps2ip read error: {e}. Reconnecting...')
-                if self.__stream:
-                    self.__stream.close()
-                    self.__stream = None
-                if self.__socket:
-                    self.__socket.close()
-                    self.__socket = None
-                time.sleep(5)
-                try:
-                    self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.__socket.settimeout(60)
-                    self.__socket.connect((self.host, self.port))
-                    self.__stream = self.__socket.makefile(mode='r')
-                    logging.info('[WARDRIVER] Reconnected to gps2ip socket')
-                except Exception as reconnect_err:
-                    logging.error(f'[WARDRIVER] gps2ip reconnect failed: {reconnect_err}')
+        self.coordinates = {'Latitude': None, 'Longitude': None, 'Altitude': None}
+        self.__last_altitude = None
+        self.__last_update = None
 
 class SerialGpsClient(Gps2IpClient):
     DEFAULT_DEVICE = '/dev/ttyUSB0'
@@ -884,8 +943,9 @@ class Wardriver(plugins.Plugin):
     def on_ui_update(self, ui):
         if self.__gps_config['method'] == 'gpsd' and self.ready:
             self.__gpsd_client.get_coordinates() # Poll to keep the socket open
-        if self.ready and self.__gps_config['method'] == 'serial':
-            gps_data = self.__serial_client.get_coordinates()
+        if self.ready and self.__gps_config['method'] in ['serial', 'gps2ip']:
+            client = self.__serial_client if self.__gps_config['method'] == 'serial' else self.__gps2ip_client
+            gps_data = client.get_coordinates()
             self.__gps_available = gps_data is not None
             for coordinate in ['latitude', 'longitude', 'altitude']:
                 self.__last_gps[coordinate] = gps_data[coordinate.capitalize()] if gps_data else '-'
@@ -966,8 +1026,7 @@ class Wardriver(plugins.Plugin):
                 gps_data = self.__pwndroid_client.coordinates
 
         if self.__gps_config['method'] == 'gps2ip':
-            if self.__gps2ip_client.coordinates['Latitude'] is not None:
-                gps_data = self.__gps2ip_client.coordinates
+            gps_data = self.__gps2ip_client.get_coordinates()
 
         if self.__gps_config['method'] == 'serial':
             gps_data = self.__serial_client.get_coordinates()

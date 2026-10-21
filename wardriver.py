@@ -14,6 +14,7 @@ import pwnagotchi.ui.fonts as fonts
 from flask import abort
 from flask import render_template_string
 import socket
+import struct
 import time
 
 try:
@@ -355,17 +356,23 @@ class GpsdClient():
 
 
 class Gps2IpClient():
-    DEFAULT_HOST = '172.20.10.1'
+    AUTO_HOST = 'auto'
+    DEFAULT_HOST = '172.20.10.1' # iPhone personal hotspot gateway
     DEFAULT_PORT = 11123
+    DEFAULT_INTERFACE_PREFIX = 'bnep'
+    ROUTE_FILE = '/proc/net/route'
     CONNECT_TIMEOUT = 5
     READ_TIMEOUT = 1
-    STALE_TIMEOUT = 60
+    IDLE_TIMEOUT = 15 # Reopen the socket when the phone stops sending NMEA
+    STALE_TIMEOUT = 60 # Drop the cached fix when no valid position arrives
     RETRY_DELAY = 5
+    FRESH_DATA_WINDOW = 5
     MAX_BUFFER_SIZE = 8192
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, interface_prefix=DEFAULT_INTERFACE_PREFIX):
         self.host = host
         self.port = port
+        self.interface_prefix = interface_prefix
         self.coordinates = {
             'Latitude': None,
             'Longitude': None,
@@ -374,7 +381,9 @@ class Gps2IpClient():
         self.__socket = None
         self.__last_altitude = None
         self.__last_update = None
+        self.__last_received = None
         self.__stop = Event()
+        self.__wake = Event()
         self.__lock = Lock()
         self.__lifecycle_lock = Lock()
         self.__connected = False
@@ -385,31 +394,100 @@ class Gps2IpClient():
             if self.__thread and self.__thread.is_alive():
                 return
             self.__stop.clear()
+            self.__wake.clear()
             self.__thread = Thread(target=self.__read_loop, daemon=True)
             self.__thread.start()
+
+    def ensure_running(self):
+        '''
+        Restart the worker if it died unexpectedly, unless disconnect() was requested
+        '''
+        if self.__stop.is_set():
+            return
+        if self.__thread is None or not self.__thread.is_alive():
+            logging.warning('[WARDRIVER] gps2ip worker not running, restarting it')
+            self.connect()
 
     def disconnect(self):
         with self.__lifecycle_lock:
             self.__stop.set()
+            self.__wake.set()
             with self.__lock:
                 connection = self.__socket
                 self.__connected = False
                 self.__clear_coordinates()
+            self.__shutdown(connection)
             if connection is not None:
-                # Wake a blocked recv before waiting for the worker to exit.
-                try:
-                    connection.shutdown(socket.SHUT_RDWR)
-                except OSError as e:
-                    logging.debug(f'[WARDRIVER] gps2ip shutdown: {e}')
                 connection.close()
             if self.__thread:
                 self.__thread.join(timeout=self.CONNECT_TIMEOUT + 2)
                 if self.__thread.is_alive():
                     logging.error('[WARDRIVER] gps2ip worker did not stop in time')
 
+    def reconnect(self, reason, force=True):
+        '''
+        Skip the retry delay and, when the current link is not delivering data, reopen the socket now.
+        '''
+        with self.__lock:
+            connection = self.__socket
+            fresh = (self.__connected and self.__last_received is not None
+                     and time.monotonic() - self.__last_received < self.FRESH_DATA_WINDOW)
+        if fresh and not force:
+            return
+        logging.info(f'[WARDRIVER] gps2ip reconnect requested: {reason}')
+        self.__wake.set()
+        # Wake a blocked recv so the worker reconnects on the new link.
+        self.__shutdown(connection)
+
     def is_connected(self):
         with self.__lock:
             return self.__connected and not self.__stop.is_set()
+
+    def __shutdown(self, connection):
+        if connection is None:
+            return
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError as e:
+            logging.debug(f'[WARDRIVER] gps2ip shutdown: {e}')
+
+    def _bluetooth_gateway(self):
+        '''
+        Return the gateway of the Bluetooth PAN interface, which is the phone running gps2ip
+        '''
+        try:
+            with open(self.ROUTE_FILE, 'r') as routes:
+                next(routes, None)
+                for line in routes:
+                    fields = line.split()
+                    if len(fields) < 4 or not fields[0].startswith(self.interface_prefix):
+                        continue
+                    gateway = int(fields[2], 16)
+                    if int(fields[3], 16) & 0x2 and gateway:
+                        return '.'.join(str(octet) for octet in struct.pack('=L', gateway))
+        except (OSError, ValueError) as e:
+            logging.debug(f'[WARDRIVER] Cannot read routing table: {e}')
+        return None
+
+    def _resolve_host(self):
+        if self.host and self.host != self.AUTO_HOST:
+            return self.host
+        return self._bluetooth_gateway() or self.DEFAULT_HOST
+
+    def __enable_keepalive(self, connection):
+        options = [
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            (socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPIDLE', None), 10),
+            (socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPINTVL', None), 5),
+            (socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPCNT', None), 3),
+        ]
+        for level, option, value in options:
+            if option is None:
+                continue
+            try:
+                connection.setsockopt(level, option, value)
+            except OSError as e:
+                logging.debug(f'[WARDRIVER] gps2ip keepalive option not set: {e}')
 
     def get_coordinates(self):
         with self.__lock:
@@ -422,33 +500,41 @@ class Gps2IpClient():
             return self.coordinates.copy()
 
     def __read_loop(self):
+        failures = 0
         while not self.__stop.is_set():
+            self.__wake.clear()
             connection = None
+            host = self._resolve_host()
             try:
                 connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 with self.__lock:
                     self.__socket = connection
                 connection.settimeout(self.CONNECT_TIMEOUT)
-                connection.connect((self.host, self.port))
+                self.__enable_keepalive(connection)
+                connection.connect((host, self.port))
                 connection.settimeout(self.READ_TIMEOUT)
                 with self.__lock:
                     if self.__stop.is_set():
                         break
                     self.__connected = True
-                logging.info('[WARDRIVER] Connected to gps2ip socket')
+                    self.__last_received = time.monotonic()
+                logging.info(f'[WARDRIVER] Connected to gps2ip socket at {host}:{self.port}')
+                failures = 0
                 buffer = b''
-                last_received = time.monotonic()
                 while not self.__stop.is_set():
                     self.get_coordinates()
-                    if time.monotonic() - last_received >= self.STALE_TIMEOUT:
-                        raise TimeoutError('no gps2ip data for 60s')
+                    with self.__lock:
+                        idle = time.monotonic() - self.__last_received
+                    if idle >= self.IDLE_TIMEOUT:
+                        raise TimeoutError(f'no gps2ip data for {self.IDLE_TIMEOUT}s')
                     try:
                         data = connection.recv(4096)
                     except socket.timeout:
                         continue
                     if not data:
                         raise ConnectionError('gps2ip stream closed')
-                    last_received = time.monotonic()
+                    with self.__lock:
+                        self.__last_received = time.monotonic()
                     buffer += data
                     while b'\n' in buffer:
                         raw, buffer = buffer.split(b'\n', 1)
@@ -456,18 +542,26 @@ class Gps2IpClient():
                     if len(buffer) > self.MAX_BUFFER_SIZE:
                         logging.warning('[WARDRIVER] Discarding oversized gps2ip sentence')
                         buffer = b''
-            except OSError as e:
+            except Exception as e:
                 if not self.__stop.is_set():
-                    logging.warning(f'[WARDRIVER] gps2ip connection failed: {e}. Retrying in {self.RETRY_DELAY}s')
+                    failures += 1
+                    message = f'[WARDRIVER] gps2ip connection to {host}:{self.port} failed: {e}. Retrying in {self.RETRY_DELAY}s'
+                    # Avoid flooding the log while the phone is unreachable.
+                    if failures == 1 or failures % 12 == 0:
+                        logging.warning(f'{message} (attempt {failures})')
+                    else:
+                        logging.debug(message)
             finally:
                 with self.__lock:
                     self.__connected = False
                     self.__socket = None
+                    self.__last_received = None
                     self.__clear_coordinates()
                 if connection is not None:
                     connection.close()
-            if self.__stop.wait(self.RETRY_DELAY):
+            if self.__stop.is_set():
                 break
+            self.__wake.wait(self.RETRY_DELAY)
 
     def __process_sentence(self, raw):
         try:
@@ -875,18 +969,18 @@ class Wardriver(plugins.Plugin):
             except Exception as e:
                 logging.critical(f'[WARDRIVER] Unexpected error while connecting to pwndroid. Error: {e}')
         elif self.__gps_config['method'] == 'gps2ip':
-            try:
-                self.__gps_config['host'] = self.options['gps']['host']
-                self.__gps_config['port'] = self.options['gps']['port']
-            except Exception:
-                self.__gps_config['host'] = Gps2IpClient.DEFAULT_HOST
-                self.__gps_config['port'] = Gps2IpClient.DEFAULT_PORT
+            options = self.options.get('gps', {})
+            self.__gps_config['host'] = options.get('host', Gps2IpClient.AUTO_HOST)
+            self.__gps_config['port'] = options.get('port', Gps2IpClient.DEFAULT_PORT)
+            self.__gps_config['interface'] = options.get('interface', Gps2IpClient.DEFAULT_INTERFACE_PREFIX)
 
             try:
-                self.__gps2ip_client = Gps2IpClient(host=self.__gps_config['host'], port=self.__gps_config['port'])
+                self.__gps2ip_client = Gps2IpClient(host=self.__gps_config['host'],
+                                                    port=int(self.__gps_config['port']),
+                                                    interface_prefix=self.__gps_config['interface'])
                 self.__gps2ip_client.connect()
-            except Exception:
-                logging.critical('[WARDRIVER] Failed connecting to gps2ip. Will try again soon.')
+            except Exception as e:
+                logging.critical(f'[WARDRIVER] Failed starting gps2ip client: {e}')
         elif self.__gps_config['method'] == 'serial':
             options = self.options.get('gps', {})
             self.__gps_config['device'] = options.get('device', SerialGpsClient.DEFAULT_DEVICE)
@@ -897,6 +991,15 @@ class Wardriver(plugins.Plugin):
 
     def on_ready(self, agent):
         self.__agent_mode = agent.mode
+
+    def on_bt_tether_connected(self, agent, event_data=None):
+        if self.__gps2ip_client:
+            # A new PAN link makes any previous TCP socket unusable; skip the retry delay.
+            self.__gps2ip_client.reconnect('bluetooth tether connected', force=False)
+
+    def on_bt_tether_disconnected(self, agent, event_data=None):
+        if self.__gps2ip_client:
+            self.__gps2ip_client.reconnect('bluetooth tether disconnected')
 
     def __load_global_whitelist(self):
         try:
@@ -945,7 +1048,9 @@ class Wardriver(plugins.Plugin):
             self.__gpsd_client.get_coordinates() # Poll to keep the socket open
         if self.ready and self.__gps_config['method'] in ['serial', 'gps2ip']:
             client = self.__serial_client if self.__gps_config['method'] == 'serial' else self.__gps2ip_client
-            gps_data = client.get_coordinates()
+            if client is self.__gps2ip_client and client:
+                client.ensure_running()
+            gps_data = client.get_coordinates() if client else None
             self.__gps_available = gps_data is not None
             for coordinate in ['latitude', 'longitude', 'altitude']:
                 self.__last_gps[coordinate] = gps_data[coordinate.capitalize()] if gps_data else '-'
@@ -982,7 +1087,7 @@ class Wardriver(plugins.Plugin):
                     ui.remove_element('wardriver_lon')
         if self.__gps_config['method'] == 'gpsd':
             self.__gpsd_client.disconnect()
-        if self.__gps_config['method'] == 'gps2ip':
+        if self.__gps_config['method'] == 'gps2ip' and self.__gps2ip_client:
             self.__gps2ip_client.disconnect()
         if self.__gps_config['method'] == 'serial':
             self.__serial_client.disconnect()
@@ -1025,7 +1130,7 @@ class Wardriver(plugins.Plugin):
             if self.__pwndroid_client.is_connected():
                 gps_data = self.__pwndroid_client.coordinates
 
-        if self.__gps_config['method'] == 'gps2ip':
+        if self.__gps_config['method'] == 'gps2ip' and self.__gps2ip_client:
             gps_data = self.__gps2ip_client.get_coordinates()
 
         if self.__gps_config['method'] == 'serial':

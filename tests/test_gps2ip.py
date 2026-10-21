@@ -1,8 +1,11 @@
 import ast
 import logging
+import os
 from pathlib import Path
 import queue
 import socket
+import struct
+import tempfile
 from threading import Event, Lock, Thread
 import time
 import types
@@ -27,6 +30,7 @@ class FakeSocket:
         self.closed = False
         self.connect = Mock()
         self.settimeout = Mock()
+        self.setsockopt = Mock()
 
     def recv(self, size):
         try:
@@ -49,11 +53,12 @@ class Gps2IpTests(unittest.TestCase):
         network = types.SimpleNamespace(
             socket=self.factory, AF_INET=socket.AF_INET,
             SOCK_STREAM=socket.SOCK_STREAM, SHUT_RDWR=socket.SHUT_RDWR,
-            timeout=socket.timeout,
+            SOL_SOCKET=socket.SOL_SOCKET, SO_KEEPALIVE=socket.SO_KEEPALIVE,
+            IPPROTO_TCP=socket.IPPROTO_TCP, timeout=socket.timeout,
         )
         self.namespace = dict(
             socket=network, Event=Event, Lock=Lock, Thread=Thread,
-            time=time, logging=logging,
+            time=time, logging=logging, struct=struct,
         )
         exec(compile(clients, str(source), 'exec'), self.namespace)  # noqa: S102
         self.client = self.namespace['Gps2IpClient']('127.0.0.1', 11123)
@@ -124,10 +129,98 @@ class Gps2IpTests(unittest.TestCase):
         self.send_fix(self.first)
 
     def test_idle_socket_is_reopened(self):
-        self.client.STALE_TIMEOUT = 0.03
+        self.client.IDLE_TIMEOUT = 0.03
         self.client.connect()
         self.wait_for(lambda: self.factory.call_count == 2)
         self.assertTrue(self.first.closed)
+
+    def write_routes(self, *rows):
+        handle, path = tempfile.mkstemp()
+        self.addCleanup(os.remove, path)
+        with os.fdopen(handle, 'w') as routes:
+            routes.write('Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\t'
+                         'Metric\tMask\n')
+            for row in rows:
+                routes.write(row + '\n')
+        self.client.ROUTE_FILE = path
+
+    def test_auto_host_uses_bluetooth_gateway(self):
+        android = '.'.join(str(o) for o in (192, 168, 44, 1))
+        gateway = struct.unpack('=L', bytes([192, 168, 44, 1]))[0]
+        self.write_routes(
+            'wlan0mon\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000',
+            'bnep0\t002CA8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF',
+            f'bnep0\t00000000\t{gateway:08X}\t0003\t0\t0\t214\t00000000',
+        )
+        self.client.host = 'auto'
+        self.assertEqual(self.client._resolve_host(), android)
+        self.client.connect()
+        self.wait_for(self.client.is_connected)
+        self.first.connect.assert_called_once_with((android, 11123))
+
+    def test_auto_host_falls_back_without_bluetooth_route(self):
+        self.write_routes(
+            'usb0\t00000000\t0102000A\t0003\t0\t0\t0\t00000000')
+        self.client.host = 'auto'
+        self.assertEqual(self.client._resolve_host(),
+                         self.client.DEFAULT_HOST)
+        self.client.ROUTE_FILE = '/nonexistent/route'
+        self.assertEqual(self.client._resolve_host(),
+                         self.client.DEFAULT_HOST)
+
+    def test_explicit_host_is_not_overridden(self):
+        self.write_routes(
+            'bnep0\t00000000\t012CA8C0\t0003\t0\t0\t0\t00000000')
+        self.assertEqual(self.client._resolve_host(), '127.0.0.1')
+
+    def test_keepalive_is_enabled(self):
+        self.client.connect()
+        self.wait_for(self.client.is_connected)
+        self.first.setsockopt.assert_any_call(
+            socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    def test_bluetooth_event_skips_retry_delay(self):
+        self.client.RETRY_DELAY = 60
+        self.first.connect.side_effect = ConnectionRefusedError('no PAN')
+        self.client.connect()
+        self.wait_for(lambda: self.first.closed)
+        self.client.reconnect('bluetooth tether connected', force=False)
+        self.wait_for(self.client.is_connected)
+        self.assertEqual(self.factory.call_count, 2)
+
+    def test_bluetooth_event_keeps_healthy_connection(self):
+        self.client.connect()
+        self.send_fix(self.first)
+        self.client.reconnect('bluetooth tether connected', force=False)
+        time.sleep(0.05)
+        self.assertEqual(self.factory.call_count, 1)
+        self.assertTrue(self.client.is_connected())
+
+    def test_bluetooth_disconnect_drops_connection(self):
+        self.client.connect()
+        self.send_fix(self.first)
+        self.client.reconnect('bluetooth tether disconnected')
+        self.wait_for(lambda: self.factory.call_count == 2
+                      and self.client.is_connected())
+        self.assertTrue(self.first.closed)
+        self.assertIsNone(self.client.get_coordinates())
+
+    def test_unexpected_error_does_not_kill_worker(self):
+        self.first.connect.side_effect = RuntimeError('boom')
+        self.client.connect()
+        self.wait_for(self.client.is_connected)
+        self.assertEqual(self.factory.call_count, 2)
+
+    def test_ensure_running_restarts_dead_worker_only(self):
+        self.client.ensure_running()
+        self.wait_for(self.client.is_connected)
+        worker = self.client._Gps2IpClient__thread
+        self.client.ensure_running()
+        self.assertIs(self.client._Gps2IpClient__thread, worker)
+        self.client.disconnect()
+        self.client.ensure_running()
+        self.assertFalse(self.client._Gps2IpClient__thread.is_alive())
+        self.assertEqual(self.factory.call_count, 1)
 
     def test_fix_expiry_returns_none(self):
         self.client.connect()

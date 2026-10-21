@@ -149,15 +149,26 @@ main.plugins.wardriver.gps.port = 8080
 ```
 #### gps2ip
 
-Enable the TCP NMEA server in gps2ip and configure the phone's reachable IP address and listening port:
+Enable the TCP NMEA server in gps2ip on your phone and connect the pwnagotchi to it via Bluetooth tethering (for example with the [bt-tether](https://github.com/wsvdmeer/pwnagotchi-plugins/blob/main/bt-tether/README.md) plugin).
 
 ```toml
 main.plugins.wardriver.gps.method = "gps2ip"
-main.plugins.wardriver.gps.host = "172.20.10.1"
+
+# OPTIONAL: phone IP address. "auto" (default) uses the gateway of the Bluetooth PAN
+# interface, so it works with iPhone (172.20.10.1) and Android (192.168.44.1) tethering.
+# If no Bluetooth route is found, 172.20.10.1 is used.
+main.plugins.wardriver.gps.host = "auto"
+
+# OPTIONAL: gps2ip TCP port. By default, 11123 is used
 main.plugins.wardriver.gps.port = 11123
+
+# OPTIONAL: prefix of the Bluetooth PAN interface used for "auto" host detection. By default, "bnep" is used
+main.plugins.wardriver.gps.interface = "bnep"
 ```
 
-Connections run in the background with a 5-second connection timeout. Failed initial connections and dropped connections retry every 5 seconds until the plugin is unloaded. Connections that send no data for 60 seconds are reopened. Cached coordinates and altitude are cleared on disconnect or after 60 seconds without a valid fix, so old positions are not logged during an outage. Malformed NMEA sentences are skipped without reconnecting.
+Connections run in the background with a 5-second connection timeout and TCP keepalive. Failed and dropped connections retry every 5 seconds until the plugin is unloaded, and the phone address is re-detected before each attempt. If the phone stops sending data for 15 seconds (for example a half-open Bluetooth link), the socket is reopened. When bt-tether emits `bt_tether_connected` or `bt_tether_disconnected`, the plugin reconnects immediately instead of waiting for the next retry. A watchdog restarts the connection worker if it ever stops unexpectedly.
+
+Cached coordinates and altitude are cleared on disconnect or after 60 seconds without a valid fix, so old positions are not logged during an outage. Malformed NMEA sentences are skipped without reconnecting.
 
 #### Serial GPS
 

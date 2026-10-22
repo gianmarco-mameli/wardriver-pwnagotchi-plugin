@@ -395,6 +395,7 @@ class Gps2IpClient():
                 return
             self.__stop.clear()
             self.__wake.clear()
+            logging.info(f'[WARDRIVER] Starting gps2ip worker (host={self.host}, port={self.port}, retrying until connected)')
             self.__thread = Thread(target=self.__read_loop, daemon=True)
             self.__thread.start()
 
